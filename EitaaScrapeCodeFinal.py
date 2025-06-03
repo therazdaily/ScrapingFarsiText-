@@ -1,156 +1,103 @@
 import os
 import time
+import requests
 import pandas as pd
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 from datetime import datetime
-import re
-from hashlib import sha256
+from requests.exceptions import RequestException
 
-# Define the Eitaa channels to scrape
-channels = ["ENTER CHANNEL NAME"]
+# Customize your channels here
+channels = [
+    "police_mazandaran"
 
-# Define threshold for number of posts to scrape
-POST_THRESHOLD = 3000  # Adjust this to your desired number of posts
-CHECKPOINT_INTERVAL = 500  # Save checkpoint every 100 messages
+   # "police_khj",
+    # "@policehamedan",
+   # "police_mazandaran",
 
-# Setup ChromeDriver
-options = Options()
-options.add_argument("--incognito")
-options.add_argument("--headless=new")
-options.add_argument("--disable-blink-features=AutomationControlled")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--disable-gpu")
-options.add_argument("--window-size=1920,1080")
+]
 
-service = Service(ChromeDriverManager().install())
-driver = webdriver.Chrome(service=service, options=options)
+# Scraper settings
+MAX_PAGES = 20000
+AUTOSAVE_EVERY = 10
+OUTPUT_FOLDER = os.path.expanduser("~/Downloads/Eitaa_Scraped_Data/Round 2")
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# Create a folder for saving files
-downloads_folder = os.path.expanduser("~/Downloads/Eitaa_Scraped_Data")
-os.makedirs(downloads_folder, exist_ok=True)
+# Retry-safe request
+def safe_get(url, headers, max_retries=5):
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            r.raise_for_status()
+            return r
+        except RequestException as e:
+            print(f" Attempt {attempt+1}/{max_retries} failed: {e}")
+            time.sleep(2 * (attempt + 1))
+    print("Max retries exceeded.")
+    exit()
 
-# Define a function to save a checkpoint of the data
-def save_checkpoint(data, output_file, channel_name):
-    if data:
-        df = pd.DataFrame(data)
-        df.to_csv(output_file, mode='a', index=False, encoding="utf-8-sig", header=not os.path.exists(output_file))
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Checkpoint saved for {channel_name}: {len(df)} messages.")
+# Main scraping loop for each channel
+for channel_slug in channels:
+    base_url = f"https://eitaa.com/{channel_slug}"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = os.path.join(OUTPUT_FOLDER, f"{channel_slug}_messages_{timestamp}.csv")
 
-# Data collection from multiple channels
-for channel_name in channels:
-    base_url = f"https://eitaa.com/{channel_name}"
-    output_file = os.path.join(downloads_folder, f"{channel_name}_messages.csv")
+    print(f"\n📡 Starting scrape for channel: {channel_slug}")
+    all_data = []
+    seen_ids = set()
+    before_id = None
 
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔍 Starting Scraping: {channel_name}...")
+    for page in range(1, MAX_PAGES - 1):
+        url = base_url + (f"?before={before_id}" if before_id else "")
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 Fetching: {url}")
 
-    driver.get(base_url)
-    time.sleep(10)
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Page loaded successfully for {channel_name}")
+        response = safe_get(url, headers)
+        soup = BeautifulSoup(response.text, "html.parser")
+        message_blocks = soup.find_all("div", class_= "etme_widget_message_wrap js-widget_message_wrap")
 
-    all_data = []  # Store messages for this channel
-    seen_message_ids = set()  # Set to track already scraped message IDs
-    message_counter = 1  # Track numbering in a more readable format
+        if not message_blocks:
+            print(f"No more messages in {channel_slug}. Ending.")
+            break
 
-    # Scroll down first to load older messages
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(10)
+        new_this_round = 0
+        for msg in message_blocks:
+            msg_id = msg.get("id")
+            if not msg_id or msg_id in seen_ids:
+                continue
 
-    try:
-        while len(all_data) < POST_THRESHOLD:
-            soup = BeautifulSoup(driver.page_source, "html.parser")
-            message_blocks = soup.find_all("div", class_="etme_widget_message_wrap")
+            seen_ids.add(msg_id)
+            before_id = msg_id
 
-            if not message_blocks:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] No more messages found. Stopping scrape.")
-                break
+            text_block = msg.find("div", class_="etme_widget_message_text")
+            message_text = text_block.get_text(strip=True) if text_block else "No Text"
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔎 Extracting messages... Current count: {len(all_data)}")
-            new_messages_found = False
+            date_block = msg.find("a", class_="etme_widget_message_date")
+            time_tag = date_block.find("time") if date_block else None
+            post_date = time_tag["datetime"] if time_tag and time_tag.has_attr("datetime") else "Unknown"
 
-            for msg_block in message_blocks:
-                try:
-                    message_id = msg_block.get("id")
+            all_data.append({
+                "Scrape Index": len(all_data) + 1,
+                "Post ID": msg_id,
+                "PostD ate": post_date,
+                "Date Scraped": datetime.now().isoformat(),
+                "Message": message_text,
+                "Link": f"{base_url}/{msg_id}",
+            })
+            new_this_round += 1
 
-                    # Extract message text and date
-                    text_block = msg_block.find("div", class_="etme_widget_message_text")
-                    message_text = text_block.get_text(strip=True) if text_block else "No Text Available"
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Added {new_this_round} messages | Total: {len(all_data)}")
+        time.sleep(1.5)
 
-                    date_block = msg_block.find("a", class_="etme_widget_message_date")
-                    message_date = date_block.find("time")["datetime"] if date_block else "Unknown Date"
+        # Autosave
+        if page % AUTOSAVE_EVERY == 0:
+            df = pd.DataFrame(all_data)
+            df.to_csv(output_file, index=False, encoding="utf-8-sig")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Autosaved {len(df)} posts")
 
-                    # If ID is missing, generate a unique hash from text + date
-                    if not message_id:
-                        unique_hash = sha256((message_text + message_date).encode()).hexdigest()
-                        message_id = f"MSG-{message_counter:05d}"  # Prettier numbering
-                        message_counter += 1
-                    else:
-                        message_id = f"MSG-{int(message_id):05d}"  # Ensure consistent format
-
-                    # Skip duplicate messages
-                    if message_id in seen_message_ids:
-                        continue
-                    seen_message_ids.add(message_id)
-                    new_messages_found = True
-
-                    # Extract views correctly
-                    view_block = msg_block.find("span", class_="etme_widget_message_views")
-                    views_text = view_block.get_text(strip=True) if view_block else "0"
-                    if "هزار" in views_text:
-                        views = int(float(re.sub(r'[^0-9.]', '', views_text)) * 1000)
-                    elif views_text.isdigit():
-                        views = int(re.sub(r'[^0-9]', '', views_text))
-                    else:
-                        views = 0
-
-                    # Store extracted data
-                    all_data.append({
-                        "Channel": channel_name,
-                        "Number": message_id,
-                        "Date": message_date,
-                        "Message": message_text,
-                        "Views": views
-                    })
-
-                    # Save checkpoint periodically
-                    if len(all_data) % CHECKPOINT_INTERVAL == 0:
-                        save_checkpoint(all_data, output_file, channel_name)
-
-                except Exception as e:
-                    print(f"Error processing message: {e}")
-
-            # If no new messages were found, keep scrolling up until new messages appear
-            while not new_messages_found:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 No new messages. Scrolling up...")
-                driver.execute_script("window.scrollBy(0, -1000);")
-                time.sleep(5)
-                soup = BeautifulSoup(driver.page_source, "html.parser")
-                message_blocks = soup.find_all("div", class_="etme_widget_message_wrap")
-                for msg_block in message_blocks:
-                    message_id = msg_block.get("id")
-                    if message_id and message_id not in seen_message_ids:
-                        new_messages_found = True
-                        break
-
-            # Scroll **down** first, then **up** to load older messages
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(10)
-            driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(10)
-
-    except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Error during scraping: {e}")
-        # Save checkpoint if an error occurs
-        save_checkpoint(all_data, output_file, channel_name)
-    finally:
-        # Final save after all messages are scraped or if an error occurred
-        save_checkpoint(all_data, output_file, channel_name)
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Finished scraping {channel_name}. Total messages: {len(all_data)}")
-
-# Close ChromeDriver
-driver.quit()
-print(f"[{datetime.now().strftime('%H:%M:%S')}] Scraping completed for all channels!")
+    # Final save per channel
+    df = pd.DataFrame(all_data)
+    df.to_csv(output_file, index=False, encoding="utf-8-sig")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Finished {channel_slug} — saved {len(df)} posts to {output_file}")
